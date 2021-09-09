@@ -1,0 +1,158 @@
+name: Deploy to Dev
+on:
+  workflow_dispatch:
+    inputs:
+      branch-tag-sha:
+        description: The branch, tag or sha of the terraform that should be deployed to the Dev subscription.
+        required: true
+
+env:
+  PLAN_STORAGE_CONTAINER: 'tfstate'
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  ARM_ENVIRONMENT: 'public'
+  TF_VERSION: '~>1.0.4'
+  RESOURCE_GROUP: COD-D-WestUS2-Terraform-RGRP
+  STORAGE_ACCOUNT: coddterraformsa
+  ENVIRONMENT_TO_DEPLOY: 'dev' #Cant not be used in jobs.<job-id>.environment
+
+jobs:
+
+  tf-plan:
+    runs-on: "ubuntu-20.04"
+    environment: dev
+    env: 
+      TF_WORKING_DIR: './dev'
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: '${{ env.TF_WORKING_DIR }}'
+
+    outputs:
+      tf_plan_name: ${{ steps.upload.outputs.tf_plan_name }}
+      maintenance_window_id: ${{ steps.open-window.outputs.maintenance-window-id }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.inputs.branch-tag-sha }}
+
+      - name: AZ Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        id: setup
+        uses: hashicorp/setup-terraform@v1.2.1
+        with:
+          terraform_version: '${{ env.TF_VERSION }}'
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          mkdir plans
+          terraform plan -no-color \
+            -out=./plans/tfplan
+
+      - name: Upload plan to blob storage
+        id: upload
+        shell: pwsh
+        run: |
+          $currentTime = Get-Date -Format "yyyymmdd-HHmmss"
+          $terraformPlanName = "$(Get-Date -Format 'yyyymmdd-HHmmss').plan.zip"
+          $terraformBlobName = "plans/$terraformPlanName"
+          Add-Type -Assembly "System.IO.Compression.FileSystem"
+          [System.IO.Compression.ZipFile]::CreateFromDirectory("plans", $terraformPlanName)
+          echo "Terraform Plan Name: $terraformPlanName"
+          echo "current directory:"
+          ls -R
+          echo "Uploading tf plan to azure storage account ${{ env.STORAGE_ACCOUNT }}"
+          $key = az storage account keys list --account-name ${{ env.STORAGE_ACCOUNT }} --resource-group ${{ env.RESOURCE_GROUP }} --query [0].value -o tsv
+          az storage blob upload --no-progress --auth-mode key --account-key $key --account-name ${{ env.STORAGE_ACCOUNT }} --container-name ${{ env.PLAN_STORAGE_CONTAINER }} --file $terraformPlanName --name $terraformBlobName
+          echo "The plan was successfully uploaded"
+          echo "::set-output name=tf_plan_name::$terraformPlanName"
+
+      - name: Azure logout
+        run: |
+          az logout
+          az cache purge
+          az account clear
+
+  technical-approval:
+    needs: [tf-plan]
+    runs-on: ubuntu-20.04
+    environment: 'Technical Approval'
+    steps:
+      - name: Technical Approval Received
+        run: |
+          echo "Technical approval on the tf plan was received"
+      
+  tf-apply:
+    needs: [technical-approval, tf-plan]
+    runs-on: ubuntu-20.04
+    environment: dev
+
+    env:
+       TF_WORKING_DIR: './dev'
+      
+    defaults:
+      run:
+        shell: bash
+        working-directory: '${{ env.TF_WORKING_DIR }}'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.inputs.branch-tag-sha }}
+
+      - name: AZ Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        id: setup
+        uses: hashicorp/setup-terraform@v1.2.1
+        with:
+          terraform_version: '${{ env.TF_VERSION }}'
+
+      - name: Download blob
+        shell: pwsh
+        run: |
+          mkdir plans
+          echo "Current working directory: $pwd"
+          $terraformBlobName = "plans/${{needs.tf-plan.outputs.tf_plan_name}}"
+          echo "The blob name is: $terraformBlobName"
+          Write-Host "Download blob to ./plans"
+          $key = az storage account keys list --account-name ${{env.STORAGE_ACCOUNT}} --resource-group ${{env.RESOURCE_GROUP}} --query [0].value -o tsv
+          az storage blob download --no-progress --auth-mode key --account-key $key --account-name ${{env.STORAGE_ACCOUNT}} --container-name ${{env.PLAN_STORAGE_CONTAINER}} --file $pwd/$terraformBlobName --name $terraformBlobName
+          try {
+            [System.IO.Compression.ZipFile]::ExtractToDirectory("$pwd/$terraformBlobName", "$pwd/plans")    
+          }
+          catch {
+            # Even though it hits this catch block the archive is extracted as expected.  No good explanation.
+          }
+          Write-Host "Zip extracted"
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -no-color -input=false ./plans/tfplan
+
+      - name: Azure logout
+        run: |
+          az logout
+          az cache purge
+          az account clear
