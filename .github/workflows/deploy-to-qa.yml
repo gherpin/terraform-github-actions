@@ -17,6 +17,7 @@ env:
   RESOURCE_GROUP: COD-Q-WestUS2-Terraform-RGRP
   STORAGE_ACCOUNT: codqterraformsa
   ENVIRONMENT_TO_DEPLOY: 'qa' #Cant not be used in jobs.<job-id>.environment
+  DEPLOY_BOARD_NUM: '1'
 
 jobs:
 
@@ -156,3 +157,24 @@ jobs:
           az logout
           az cache purge
           az account clear
+
+  # Custom Actions
+  # https://github.com/im-practices/git-er-done/blob/main/actions/deployment-board.md
+  update-deployment-board:
+    runs-on: ubuntu-20.04
+    needs: [tf-apply]
+    steps:
+      - uses: im-open/workflow-conclusion@v1.0.0
+        id: conclusion
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Deployment Board
+        uses: im-open/update-deployment-board@v1.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          environment: ${{ env.ENVIRONMENT_TO_DEPLOY }}
+          board-number: ${{ env.DEPLOY_BOARD_NUM }}
+          ref: ${{ github.event.inputs.branch-tag-sha }}
+          deploy-status: ${{ steps.conclusion.conclusion }}
+          timezone: 'america/denver'
