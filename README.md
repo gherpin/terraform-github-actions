@@ -2,6 +2,8 @@
 This project is an example of using Github actions to deploy terraform code to azure.
 
 ## Prerequisites
+
+### Azure
 - The Resource Group must already be present in Azure. **(e.g. COD-D-WestUS2-Terraform-RGRP)**
 - Create a Service Principal that has "Contributor" access to the resource group using powershell. 
 
